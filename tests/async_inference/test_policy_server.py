@@ -243,7 +243,11 @@ def test_get_actions_wraps_chunk_with_wallx_payload(policy_server, monkeypatch):
     assert payload["subtask_id"] == 3
     assert payload["digit"] == "1"
     assert payload["target_xy"] == [10, 20]
-    assert payload["actions"] == [action]
+    assert len(payload["actions"]) == 1
+    returned_action = payload["actions"][0]
+    assert returned_action.get_timestep() == action.get_timestep()
+    assert abs(returned_action.get_timestamp() - action.get_timestamp()) < 1e-6
+    assert torch.equal(returned_action.get_action(), action.get_action())
 
 
 def test_predict_action_chunk_strips_wallx_meta(monkeypatch, policy_server):
