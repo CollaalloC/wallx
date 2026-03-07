@@ -40,6 +40,34 @@ def test_run_high_level_rejects_empty_planning_list(monkeypatch):
         orchestrator._run_high_level("/tmp/fixed.png")
 
 
+def test_run_high_level_wraps_planner_exception(monkeypatch):
+    from lerobot.async_inference.wallx_task_runtime import WallXTaskOrchestrator
+
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    orchestrator = WallXTaskOrchestrator(logger=logging.getLogger("wallx_test"))
+
+    def _raise(_path, _key):
+        raise ValueError("planner exploded")
+
+    dummy_module = SimpleNamespace(process_inference=_raise)
+    monkeypatch.setattr(
+        "lerobot.async_inference.wallx_task_runtime.importlib.import_module",
+        lambda _name: dummy_module,
+    )
+
+    with pytest.raises(RuntimeError, match="process_inference failed"):
+        orchestrator._run_high_level("/tmp/fixed.png")
+
+
+def test_update_and_overlay_requires_fixed_image(monkeypatch):
+    from lerobot.async_inference.wallx_task_runtime import WallXTaskOrchestrator
+
+    orchestrator = WallXTaskOrchestrator(logger=logging.getLogger("wallx_test"))
+
+    with pytest.raises(RuntimeError, match="Missing fixed image"):
+        orchestrator.update_and_overlay({"observation.images.handeye": np.zeros((32, 32, 3), dtype=np.uint8)})
+
+
 def test_update_and_overlay_bootstraps_and_switches_subtasks(monkeypatch):
     from lerobot.async_inference.wallx_task_runtime import WallXTaskOrchestrator
 
