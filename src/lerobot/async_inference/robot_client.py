@@ -274,12 +274,16 @@ class RobotClient:
             return None
         return current_subtask.subtask_id
 
-    def _validate_action_payload(self, payload: Any) -> tuple[int, list[TimedAction]] | None:
+    def _validate_action_payload(
+        self, payload: Any
+    ) -> tuple[int, str | None, list[int] | None, list[TimedAction]] | None:
         if not isinstance(payload, dict):
             self.logger.error("Malformed action payload received: expected dict, got %s", type(payload))
             return None
 
         subtask_id = payload.get("subtask_id")
+        digit = payload.get("digit")
+        target_xy = payload.get("target_xy")
         timed_actions = payload.get("actions")
         if not isinstance(subtask_id, int):
             self.logger.error("Malformed action payload received: invalid subtask_id=%r", subtask_id)
@@ -288,7 +292,7 @@ class RobotClient:
             self.logger.error("Malformed action payload received: invalid actions field")
             return None
 
-        return subtask_id, timed_actions
+        return subtask_id, digit, target_xy, timed_actions
 
     def _clear_action_queue(self) -> int:
         with self.action_queue_lock:
@@ -319,8 +323,13 @@ class RobotClient:
                 if validated_payload is None:
                     continue
 
-                subtask_id, timed_actions = validated_payload
-                self.logger.info("Received action payload | subtask_id=%s", subtask_id)
+                subtask_id, digit, target_xy, timed_actions = validated_payload
+                self.logger.info(
+                    "Received action payload | subtask_id=%s digit=%s target_xy=%s",
+                    subtask_id,
+                    digit,
+                    target_xy,
+                )
                 current_subtask_id = self._current_subtask_id()
                 if current_subtask_id is None or subtask_id != current_subtask_id:
                     self.logger.warning(

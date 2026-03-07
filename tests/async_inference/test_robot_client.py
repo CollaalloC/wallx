@@ -310,6 +310,21 @@ def test_receive_actions_accepts_current_subtask_payload(robot_client):
     assert robot_client.action_queue.qsize() == 1
 
 
+def test_validate_action_payload_extracts_digit_and_target_xy(robot_client):
+    """Payload validation should extract task metadata alongside the actions list."""
+    action = _make_actions(start_ts=time.time(), start_t=5, count=1)[0]
+    payload = {
+        "subtask_id": 2,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    validated_payload = robot_client._validate_action_payload(payload)
+
+    assert validated_payload == (2, "8", [100, 200], [action])
+
+
 def test_control_loop_observation_clears_queue_on_subtask_transition(robot_client, monkeypatch):
     """A subtask switch should flush stale queued actions and force a must-go observation."""
     captured = {}
