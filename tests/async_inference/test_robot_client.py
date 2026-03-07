@@ -283,6 +283,31 @@ def test_receive_actions_rejects_non_dict_payload(robot_client):
     assert robot_client.action_queue.empty()
 
 
+def test_receive_actions_rejects_non_timed_action_entries(robot_client):
+    """Malformed action payload entries should be rejected without crashing the receive loop."""
+    from lerobot.transport import services_pb2
+
+    bad_payload = {
+        "subtask_id": 1,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [1],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(bad_payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=1))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()
+
+
 def test_receive_actions_accepts_current_subtask_payload(robot_client):
     """Current-subtask payloads should still enter the aggregation path."""
     from lerobot.async_inference.helpers import TimedAction
@@ -375,3 +400,24 @@ def test_control_loop_observation_stops_when_orchestrator_finishes(robot_client,
     assert returned_observation is updated_observation
     assert robot_client.shutdown_event.is_set() is True
     assert captured["observation"].get_observation() is updated_observation
+
+
+def test_control_loop_observation_stops_on_orchestrator_error(robot_client, monkeypatch):
+    """Fatal orchestrator errors should stop the client instead of being swallowed."""
+    sent = {"called": False}
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (_ for _ in ()).throw(RuntimeError("planner failed"))
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: sent.__setitem__("called", True) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is None
+    assert robot_client.shutdown_event.is_set() is True
+    assert sent["called"] is False

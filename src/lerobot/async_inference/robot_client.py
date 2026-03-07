@@ -291,6 +291,9 @@ class RobotClient:
         if not isinstance(timed_actions, list):
             self.logger.error("Malformed action payload received: invalid actions field")
             return None
+        if any(not isinstance(action, TimedAction) for action in timed_actions):
+            self.logger.error("Malformed action payload received: actions must contain TimedAction entries")
+            return None
 
         return subtask_id, digit, target_xy, timed_actions
 
@@ -522,6 +525,7 @@ class RobotClient:
 
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
+            self.shutdown_event.set()
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
