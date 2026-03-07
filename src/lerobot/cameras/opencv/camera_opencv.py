@@ -109,6 +109,7 @@ class OpenCVCamera(Camera):
         self.warmup_s = config.warmup_s
 
         self.videocapture: cv2.VideoCapture | None = None
+        self.fourcc: cv2.VideoWriter_fourcc = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -155,7 +156,7 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        self.videocapture = cv2.VideoCapture(self.index_or_path)
 
         if not self.videocapture.isOpened():
             self.videocapture.release()
@@ -217,6 +218,8 @@ class OpenCVCamera(Camera):
         else:
             self._validate_width_and_height()
 
+        self._validate_fourcc()
+
         if self.fps is None:
             self.fps = self.videocapture.get(cv2.CAP_PROP_FPS)
         else:
@@ -237,26 +240,14 @@ class OpenCVCamera(Camera):
         if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
 
+
     def _validate_fourcc(self) -> None:
-        """Validates and sets the camera's FOURCC code."""
-
-        fourcc_code = cv2.VideoWriter_fourcc(*self.config.fourcc)
-
-        if self.videocapture is None:
-            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
-
-        success = self.videocapture.set(cv2.CAP_PROP_FOURCC, fourcc_code)
-        actual_fourcc_code = self.videocapture.get(cv2.CAP_PROP_FOURCC)
-
-        # Convert actual FOURCC code back to string for comparison
-        actual_fourcc_code_int = int(actual_fourcc_code)
-        actual_fourcc = "".join([chr((actual_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
-
-        if not success or actual_fourcc != self.config.fourcc:
-            logger.warning(
-                f"{self} failed to set fourcc={self.config.fourcc} (actual={actual_fourcc}, success={success}). "
-                f"Continuing with default format."
-            )
+        """Validates and sets the camera's fourcc codec."""
+        
+        fourcc_succ = self.videocapture.set(cv2.CAP_PROP_FOURCC, self.fourcc)
+        actual_fourcc = self.videocapture.get(cv2.CAP_PROP_FOURCC)
+        if not fourcc_succ or actual_fourcc != self.fourcc:
+            raise RuntimeError(f"{self} failed to set fourcc={self.fourcc} ({actual_fourcc=}, {fourcc_succ=}).")
 
     def _validate_width_and_height(self) -> None:
         """Validates and sets the camera's frame capture width and height."""
