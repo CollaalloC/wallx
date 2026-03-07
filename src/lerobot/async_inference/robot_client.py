@@ -78,6 +78,7 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+from .wallx_task_runtime import WallXTaskOrchestrator
 
 
 class RobotClient:
@@ -135,6 +136,7 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+        self.orchestrator = WallXTaskOrchestrator(logger=self.logger)
 
     @property
     def running(self):
@@ -266,6 +268,34 @@ class RobotClient:
         with self.action_queue_lock:
             self.action_queue = future_action_queue
 
+    def _current_subtask_id(self) -> int | None:
+        current_subtask = self.orchestrator.current_subtask()
+        if current_subtask is None:
+            return None
+        return current_subtask.subtask_id
+
+    def _validate_action_payload(self, payload: Any) -> tuple[int, list[TimedAction]] | None:
+        if not isinstance(payload, dict):
+            self.logger.error("Malformed action payload received: expected dict, got %s", type(payload))
+            return None
+
+        subtask_id = payload.get("subtask_id")
+        timed_actions = payload.get("actions")
+        if not isinstance(subtask_id, int):
+            self.logger.error("Malformed action payload received: invalid subtask_id=%r", subtask_id)
+            return None
+        if not isinstance(timed_actions, list):
+            self.logger.error("Malformed action payload received: invalid actions field")
+            return None
+
+        return subtask_id, timed_actions
+
+    def _clear_action_queue(self) -> int:
+        with self.action_queue_lock:
+            cleared_actions = self.action_queue.qsize()
+            self.action_queue = Queue()
+        return cleared_actions
+
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the policy server"""
         # Wait at barrier for synchronized start
@@ -283,8 +313,22 @@ class RobotClient:
 
                 # Deserialize bytes back into list[TimedAction]
                 deserialize_start = time.perf_counter()
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                action_payload = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
+                validated_payload = self._validate_action_payload(action_payload)
+                if validated_payload is None:
+                    continue
+
+                subtask_id, timed_actions = validated_payload
+                self.logger.info("Received action payload | subtask_id=%s", subtask_id)
+                current_subtask_id = self._current_subtask_id()
+                if current_subtask_id is None or subtask_id != current_subtask_id:
+                    self.logger.warning(
+                        "Dropping stale action payload | payload_subtask_id=%s current_subtask_id=%s",
+                        subtask_id,
+                        current_subtask_id,
+                    )
+                    continue
 
                 # Log device type of received actions
                 if len(timed_actions) > 0:
@@ -411,7 +455,19 @@ class RobotClient:
             start_time = time.perf_counter()
 
             raw_observation: RawObservation = self.robot.get_observation()
-            raw_observation["task"] = task
+            raw_observation, _current_subtask, subtask_changed = self.orchestrator.update_and_overlay(
+                raw_observation
+            )
+            should_stop_after_send = self.orchestrator.is_finished()
+
+            if subtask_changed:
+                cleared_actions = self._clear_action_queue()
+                self.logger.info(
+                    "Cleared stale queued actions after subtask switch | removed=%s",
+                    cleared_actions,
+                )
+                # Force immediate re-inference after a timed subtask switch.
+                self.must_go.set()
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -435,6 +491,9 @@ class RobotClient:
             if observation.must_go:
                 # must-go event will be set again after receiving actions
                 self.must_go.clear()
+
+            if should_stop_after_send:
+                self.shutdown_event.set()
 
             if verbose:
                 # Calculate comprehensive FPS metrics

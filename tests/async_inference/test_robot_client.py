@@ -281,3 +281,82 @@ def test_receive_actions_rejects_non_dict_payload(robot_client):
     robot_client.receive_actions()
 
     assert robot_client.action_queue.empty()
+
+
+def test_receive_actions_accepts_current_subtask_payload(robot_client):
+    """Current-subtask payloads should still enter the aggregation path."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    action = TimedAction(timestamp=time.time(), timestep=5, action=torch.zeros(6))
+    payload = {
+        "subtask_id": 2,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=2))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.qsize() == 1
+
+
+def test_control_loop_observation_clears_queue_on_subtask_transition(robot_client, monkeypatch):
+    """A subtask switch should flush stale queued actions and force a must-go observation."""
+    captured = {}
+    robot_client.latest_action = 7
+    robot_client.action_queue.put(_make_actions(start_ts=time.time(), start_t=8, count=1)[0])
+    robot_client.must_go.clear()
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+
+    updated_observation = {"joint1": 0.0, "task": "planned"}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (updated_observation, SimpleNamespace(subtask_id=1), True),
+        is_finished=lambda: False,
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: captured.setdefault("observation", obs) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is updated_observation
+    assert robot_client.action_queue.empty()
+    assert captured["observation"].must_go is True
+    assert captured["observation"].get_observation() is updated_observation
+
+
+def test_control_loop_observation_stops_when_orchestrator_finishes(robot_client, monkeypatch):
+    """A finished orchestrator should stop the client loop."""
+    captured = {}
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+
+    updated_observation = {"joint1": 0.0, "task": "planned"}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (updated_observation, None, False),
+        is_finished=lambda: True,
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: captured.setdefault("observation", obs) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is updated_observation
+    assert robot_client.shutdown_event.is_set() is True
+    assert captured["observation"].get_observation() is updated_observation
