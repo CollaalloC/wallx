@@ -19,8 +19,10 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import pickle
 import time
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,7 +36,7 @@ pytest.importorskip("grpc")
 
 
 @pytest.fixture()
-def robot_client():
+def robot_client(tmp_path):
     """Fresh `RobotClient` instance for each test case (no threads started).
     Uses DummyRobot."""
     # Import only when the test actually runs (after decorator check)
@@ -43,6 +45,7 @@ def robot_client():
     from tests.mocks.mock_robot import MockRobotConfig
 
     test_config = MockRobotConfig()
+    test_config.calibration_dir = tmp_path / "calibration"
 
     # gRPC channel is not actually used in tests, so using a dummy address
     test_config = RobotClientConfig(
@@ -231,3 +234,50 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_receive_actions_drops_stale_subtask_payload(robot_client):
+    """Stale action payloads should be dropped instead of reaching the queue."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    action = TimedAction(timestamp=time.time(), timestep=5, action=torch.zeros(6))
+    payload = {
+        "subtask_id": 1,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=2))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()
+
+
+def test_receive_actions_rejects_non_dict_payload(robot_client):
+    """Malformed payloads should be rejected without mutating the queue."""
+    from lerobot.transport import services_pb2
+
+    bad_payload = [1, 2, 3]
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(bad_payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=0))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()

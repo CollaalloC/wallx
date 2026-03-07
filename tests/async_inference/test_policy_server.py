@@ -17,7 +17,9 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import pickle
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -217,3 +219,58 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_get_actions_wraps_chunk_with_wallx_payload(policy_server, monkeypatch):
+    """GetActions should wrap the action chunk with the current Wall-X metadata."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    obs = _make_obs(torch.zeros(6), timestep=5, must_go=True)
+    obs.observation["__wallx_meta"] = {
+        "subtask_id": 3,
+        "digit": "1",
+        "target_xy": [10, 20],
+    }
+    action = TimedAction(timestamp=obs.timestamp, timestep=obs.timestep, action=torch.zeros(6))
+
+    monkeypatch.setattr(policy_server, "_predict_action_chunk", lambda _obs: [action])
+    policy_server.observation_queue.put(obs)
+
+    response = policy_server.GetActions(services_pb2.Empty(), SimpleNamespace(peer=lambda: "test-client"))
+    payload = pickle.loads(response.data)  # nosec
+
+    assert payload["subtask_id"] == 3
+    assert payload["digit"] == "1"
+    assert payload["target_xy"] == [10, 20]
+    assert payload["actions"] == [action]
+
+
+def test_predict_action_chunk_strips_wallx_meta(monkeypatch, policy_server):
+    """Wall-X metadata should be stripped before raw observation conversion."""
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    seen: dict[str, set[str]] = {}
+    policy_server.policy_type = "act"
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.postprocessor = lambda tensor: tensor
+
+    def _fake_raw_observation_to_observation(raw_observation, *_args):
+        seen["raw_keys"] = set(raw_observation.keys())
+        return {OBS_STATE: torch.zeros(1, 6)}
+
+    def _fake_get_action_chunk(_self, _obs, _type="act"):
+        return torch.zeros(1, policy_server.actions_per_chunk, 6)
+
+    monkeypatch.setattr(
+        "lerobot.async_inference.policy_server.raw_observation_to_observation",
+        _fake_raw_observation_to_observation,
+    )
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    obs = _make_obs(torch.zeros(6), timestep=5)
+    obs.observation["__wallx_meta"] = {"subtask_id": 3, "digit": "1", "target_xy": [10, 20]}
+
+    policy_server._predict_action_chunk(obs)
+
+    assert "__wallx_meta" not in seen["raw_keys"]
