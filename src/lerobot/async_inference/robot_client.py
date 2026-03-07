@@ -538,12 +538,15 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+            force_timeout_observation = self.orchestrator.is_subtask_timeout_reached()
             """Control loop: (1) Performing actions, when available"""
-            if self.actions_available():
+            if force_timeout_observation:
+                _captured_observation = self.control_loop_observation(task, verbose)
+            elif self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
 
             """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
+            if not force_timeout_observation and self._ready_to_send_observation():
                 _captured_observation = self.control_loop_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")

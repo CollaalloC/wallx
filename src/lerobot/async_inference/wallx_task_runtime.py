@@ -156,6 +156,12 @@ class WallXTaskOrchestrator:
             return None
         return self._subtasks[self._current_index]
 
+    def is_subtask_timeout_reached(self) -> bool:
+        current_subtask = self.current_subtask()
+        if current_subtask is None or self._current_started_at is None:
+            return False
+        return time.monotonic() - self._current_started_at >= current_subtask.timeout_sec
+
     def update_and_overlay(
         self, raw_observation: RawObservation
     ) -> tuple[RawObservation, WallXSubTask | None, bool]:

@@ -421,3 +421,31 @@ def test_control_loop_observation_stops_on_orchestrator_error(robot_client, monk
     assert returned_observation is None
     assert robot_client.shutdown_event.is_set() is True
     assert sent["called"] is False
+
+
+def test_control_loop_forces_observation_when_subtask_timeout_expires(robot_client, monkeypatch):
+    """Timeout expiry should force an observation cycle even if queue pressure says not ready."""
+    sleep_calls = {"count": 0}
+    observed_tasks: list[str] = []
+
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.actions_available = lambda: False
+    robot_client._ready_to_send_observation = lambda: False
+    robot_client.orchestrator = SimpleNamespace(is_subtask_timeout_reached=lambda: True)
+
+    def _fake_control_loop_observation(task, verbose=False):
+        observed_tasks.append(task)
+        robot_client.shutdown_event.set()
+        return {"task": task}
+
+    def _fake_sleep(_duration):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] > 1:
+            robot_client.shutdown_event.set()
+
+    monkeypatch.setattr(robot_client, "control_loop_observation", _fake_control_loop_observation)
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+
+    robot_client.control_loop(task="legacy-task")
+
+    assert observed_tasks == ["legacy-task"]
