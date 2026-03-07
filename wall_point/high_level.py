@@ -119,7 +119,9 @@ def process_inference(img_path, api_key):
 # 5. Main 依次调用与可视化保存
 # ==========================================
 if __name__ == "__main__":
-    MY_KEY = "sk-kkjtucvrvosnwlrbhhoiehxdpphvhakyytqgzcvlgqocaytl"
+    MY_KEY = os.getenv("SILICONFLOW_API_KEY")
+    if not MY_KEY:
+        raise RuntimeError("SILICONFLOW_API_KEY is required to run high_level.py directly.")
     INPUT_DIR = "input_hl"
     OUTPUT_DIR = "output_inference"
     
