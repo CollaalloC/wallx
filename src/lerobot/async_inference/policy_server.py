@@ -206,6 +206,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
+        wallx_meta = timed_observation.get_observation().get("__wallx_meta")
+        if wallx_meta is not None:
+            self.logger.info(f"Received WallX meta for observation #{obs_timestep}: {wallx_meta}")
+
         if not self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
         ):
@@ -235,7 +239,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
-            actions_bytes = pickle.dumps(action_chunk)  # nosec
+            wallx_meta = obs.get_observation().get("__wallx_meta", {})
+            action_payload = {
+                "subtask_id": wallx_meta.get("subtask_id", -1),
+                "digit": wallx_meta.get("digit"),
+                "target_xy": wallx_meta.get("target_xy"),
+                "actions": action_chunk,
+            }
+            actions_bytes = pickle.dumps(action_payload)  # nosec
             serialize_time = time.perf_counter() - start_time
 
             # Create and return the action chunk
@@ -341,8 +352,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        raw_observation = dict(observation_t.get_observation())
+        raw_observation.pop("__wallx_meta", None)
         observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
+            raw_observation,
             self.lerobot_features,
             self.policy_image_features,
         )

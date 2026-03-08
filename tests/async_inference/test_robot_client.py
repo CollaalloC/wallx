@@ -19,8 +19,10 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import pickle
 import time
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,7 +36,7 @@ pytest.importorskip("grpc")
 
 
 @pytest.fixture()
-def robot_client():
+def robot_client(tmp_path):
     """Fresh `RobotClient` instance for each test case (no threads started).
     Uses DummyRobot."""
     # Import only when the test actually runs (after decorator check)
@@ -43,6 +45,7 @@ def robot_client():
     from tests.mocks.mock_robot import MockRobotConfig
 
     test_config = MockRobotConfig()
+    test_config.calibration_dir = tmp_path / "calibration"
 
     # gRPC channel is not actually used in tests, so using a dummy address
     test_config = RobotClientConfig(
@@ -231,3 +234,218 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_receive_actions_drops_stale_subtask_payload(robot_client):
+    """Stale action payloads should be dropped instead of reaching the queue."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    action = TimedAction(timestamp=time.time(), timestep=5, action=torch.zeros(6))
+    payload = {
+        "subtask_id": 1,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=2))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()
+
+
+def test_receive_actions_rejects_non_dict_payload(robot_client):
+    """Malformed payloads should be rejected without mutating the queue."""
+    from lerobot.transport import services_pb2
+
+    bad_payload = [1, 2, 3]
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(bad_payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=0))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()
+
+
+def test_receive_actions_rejects_non_timed_action_entries(robot_client):
+    """Malformed action payload entries should be rejected without crashing the receive loop."""
+    from lerobot.transport import services_pb2
+
+    bad_payload = {
+        "subtask_id": 1,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [1],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(bad_payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=1))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.empty()
+
+
+def test_receive_actions_accepts_current_subtask_payload(robot_client):
+    """Current-subtask payloads should still enter the aggregation path."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    action = TimedAction(timestamp=time.time(), timestep=5, action=torch.zeros(6))
+    payload = {
+        "subtask_id": 2,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    class _Stub:
+        def GetActions(self, _):
+            robot_client.shutdown_event.set()
+            return services_pb2.Actions(data=pickle.dumps(payload))
+
+    robot_client.stub = _Stub()
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.orchestrator = SimpleNamespace(current_subtask=lambda: SimpleNamespace(subtask_id=2))
+
+    robot_client.receive_actions()
+
+    assert robot_client.action_queue.qsize() == 1
+
+
+def test_validate_action_payload_extracts_digit_and_target_xy(robot_client):
+    """Payload validation should extract task metadata alongside the actions list."""
+    action = _make_actions(start_ts=time.time(), start_t=5, count=1)[0]
+    payload = {
+        "subtask_id": 2,
+        "digit": "8",
+        "target_xy": [100, 200],
+        "actions": [action],
+    }
+
+    validated_payload = robot_client._validate_action_payload(payload)
+
+    assert validated_payload == (2, "8", [100, 200], [action])
+
+
+def test_control_loop_observation_clears_queue_on_subtask_transition(robot_client, monkeypatch):
+    """A subtask switch should flush stale queued actions and force a must-go observation."""
+    captured = {}
+    robot_client.latest_action = 7
+    robot_client.action_queue.put(_make_actions(start_ts=time.time(), start_t=8, count=1)[0])
+    robot_client.must_go.clear()
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+
+    updated_observation = {"joint1": 0.0, "task": "planned"}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (updated_observation, SimpleNamespace(subtask_id=1), True),
+        is_finished=lambda: False,
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: captured.setdefault("observation", obs) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is updated_observation
+    assert robot_client.action_queue.empty()
+    assert captured["observation"].must_go is True
+    assert captured["observation"].get_observation() is updated_observation
+
+
+def test_control_loop_observation_stops_when_orchestrator_finishes(robot_client, monkeypatch):
+    """A finished orchestrator should stop the client loop."""
+    captured = {}
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+
+    updated_observation = {"joint1": 0.0, "task": "planned"}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (updated_observation, None, False),
+        is_finished=lambda: True,
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: captured.setdefault("observation", obs) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is updated_observation
+    assert robot_client.shutdown_event.is_set() is True
+    assert captured["observation"].get_observation() is updated_observation
+
+
+def test_control_loop_observation_stops_on_orchestrator_error(robot_client, monkeypatch):
+    """Fatal orchestrator errors should stop the client instead of being swallowed."""
+    sent = {"called": False}
+    robot_client.robot.get_observation = lambda: {"joint1": 0.0}
+    robot_client.orchestrator = SimpleNamespace(
+        update_and_overlay=lambda raw: (_ for _ in ()).throw(RuntimeError("planner failed"))
+    )
+
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: sent.__setitem__("called", True) or True,
+    )
+
+    returned_observation = robot_client.control_loop_observation(task="legacy-task")
+
+    assert returned_observation is None
+    assert robot_client.shutdown_event.is_set() is True
+    assert sent["called"] is False
+
+
+def test_control_loop_forces_observation_when_subtask_timeout_expires(robot_client, monkeypatch):
+    """Timeout expiry should force an observation cycle even if queue pressure says not ready."""
+    sleep_calls = {"count": 0}
+    observed_tasks: list[str] = []
+
+    robot_client.start_barrier = SimpleNamespace(wait=lambda: None)
+    robot_client.actions_available = lambda: False
+    robot_client._ready_to_send_observation = lambda: False
+    robot_client.orchestrator = SimpleNamespace(is_subtask_timeout_reached=lambda: True)
+
+    def _fake_control_loop_observation(task, verbose=False):
+        observed_tasks.append(task)
+        robot_client.shutdown_event.set()
+        return {"task": task}
+
+    def _fake_sleep(_duration):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] > 1:
+            robot_client.shutdown_event.set()
+
+    monkeypatch.setattr(robot_client, "control_loop_observation", _fake_control_loop_observation)
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+
+    robot_client.control_loop(task="legacy-task")
+
+    assert observed_tasks == ["legacy-task"]
